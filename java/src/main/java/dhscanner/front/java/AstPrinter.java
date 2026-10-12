@@ -1,5 +1,6 @@
 package dhscanner.front.java;
 
+import com.sun.source.tree.AnnotationTree;
 import com.sun.source.tree.BreakTree;
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.CompilationUnitTree;
@@ -202,19 +203,124 @@ final class AstPrinter {
                 out.append(",\"text\":");
                 writeJsonString(sanitiseForLexer(text));
             }
-            out.append(",\"children\":[");
 
-            // Enter a fresh "first child" context, scan children via the
-            // default visit* implementations, then restore. Note we save
-            // the OUTER value as `false` because any sibling of `node`
-            // will need a leading comma.
-            boolean savedFirstInArray = firstInArray;
-            firstInArray = true;
-            super.scan(node, unused);
-            firstInArray = savedFirstInArray;
+            // Any ClassTree (CLASS / INTERFACE / ENUM / ANNOTATION_TYPE /
+            // RECORD) uses a richer envelope: `annotations` and `supers`
+            // are hoisted to first-class keys instead of being flattened
+            // into `children`, and the MODIFIERS node + type parameters
+            // are omitted entirely because the downstream dhscanner AST
+            // does not model them. `children` then contains ONLY the
+            // class's member declarations.
+            if (node instanceof ClassTree) {
+                ClassTree classTree = (ClassTree) node;
+                emitAnnotations(classTree.getModifiers());
+                emitSupers(classTree);
+                emitClassMembers(classTree);
+            } else if (node instanceof VariableTree) {
+                // Fields, method params, local vars, lambda params --
+                // same annotation lifting + modifier dropping as
+                // classes, plus the two distinct slots `getType()` and
+                // `getInitializer()` are promoted to named keys
+                // (`type`, `init`) instead of a 2-element positional
+                // `children` array. `init` is omitted when absent so
+                // downstream consumers can test key presence instead of
+                // null-handling.
+                VariableTree varTree = (VariableTree) node;
+                emitAnnotations(varTree.getModifiers());
+                emitNamedChild("type", varTree.getType());
+                emitNamedChild("init", varTree.getInitializer());
+            } else {
+                out.append(",\"children\":[");
+                // Enter a fresh "first child" context, scan children via
+                // the default visit* implementations, then restore. Note
+                // we save the OUTER value as `false` because any sibling
+                // of `node` will need a leading comma.
+                boolean savedFirstInArray = firstInArray;
+                firstInArray = true;
+                super.scan(node, unused);
+                firstInArray = savedFirstInArray;
+                out.append(']');
+            }
 
-            out.append("]}");
+            out.append('}');
             return null;
+        }
+
+        /**
+         * Hoist a {@link ModifiersTree}'s annotations into a dedicated
+         * top-level {@code annotations} JSON array on the enclosing
+         * node (CLASS, VARIABLE, METHOD, ...). This replaces the
+         * previous nesting under MODIFIERS, which the downstream
+         * Haskell grammar does not need to walk through.
+         */
+        private void emitAnnotations(ModifiersTree mods) {
+            out.append(",\"annotations\":[");
+            boolean saved = firstInArray;
+            firstInArray = true;
+            for (AnnotationTree a : mods.getAnnotations()) {
+                scan(a, null);
+            }
+            firstInArray = saved;
+            out.append(']');
+        }
+
+        /**
+         * Coalesce a {@link ClassTree}'s single optional
+         * {@code extends} clause and its {@code implements} list into
+         * one flat {@code supers} JSON array. The extends element (if
+         * any) comes first, followed by the implements elements in
+         * source order. Matches dhscanner's AST shape where
+         * {@code stmtClassSupers} is a single {@code [SuperName]}.
+         */
+        private void emitSupers(ClassTree node) {
+            out.append(",\"supers\":[");
+            boolean saved = firstInArray;
+            firstInArray = true;
+            Tree ext = node.getExtendsClause();
+            if (ext != null) {
+                scan(ext, null);
+            }
+            for (Tree impl : node.getImplementsClause()) {
+                scan(impl, null);
+            }
+            firstInArray = saved;
+            out.append(']');
+        }
+
+        /**
+         * Emit only the member declarations into {@code children}.
+         * Modifiers, type parameters, extends, and implements are
+         * explicitly skipped here because they are either dropped or
+         * hoisted to sibling keys above.
+         */
+        private void emitClassMembers(ClassTree node) {
+            out.append(",\"children\":[");
+            boolean saved = firstInArray;
+            firstInArray = true;
+            for (Tree member : node.getMembers()) {
+                scan(member, null);
+            }
+            firstInArray = saved;
+            out.append(']');
+        }
+
+        /**
+         * Emit a single optional child under a named key:
+         * {@code ,"keyName":{...}} when {@code child} is non-null,
+         * nothing at all otherwise. Used for the per-kind slot
+         * promotions where a positional child in {@code children}
+         * is lifted to a semantic sub-object (e.g. {@code type} and
+         * {@code init} on {@code VARIABLE}).
+         */
+        private void emitNamedChild(String keyName, Tree child) {
+            if (child == null) {
+                return;
+            }
+            out.append(",\"").append(keyName).append("\":");
+            boolean saved = firstInArray;
+            firstInArray = true;
+            scan(child, null);
+            firstInArray = saved;
         }
 
         private void emitLocation(Tree node) {
