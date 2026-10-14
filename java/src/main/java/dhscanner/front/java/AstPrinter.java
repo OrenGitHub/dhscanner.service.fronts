@@ -1,11 +1,13 @@
 package dhscanner.front.java;
 
 import com.sun.source.tree.AnnotationTree;
+import com.sun.source.tree.BinaryTree;
 import com.sun.source.tree.BreakTree;
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.ContinueTree;
 import com.sun.source.tree.IdentifierTree;
+import com.sun.source.tree.IfTree;
 import com.sun.source.tree.LabeledStatementTree;
 import com.sun.source.tree.LineMap;
 import com.sun.source.tree.LiteralTree;
@@ -14,6 +16,7 @@ import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.ModifiersTree;
 import com.sun.source.tree.PrimitiveTypeTree;
 import com.sun.source.tree.Tree;
+import com.sun.source.tree.TypeCastTree;
 import com.sun.source.tree.TypeParameterTree;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.util.JavacTask;
@@ -182,13 +185,76 @@ final class AstPrinter {
                 return null;
             }
 
+            if (node instanceof TypeCastTree) {
+                // Transparent unwrap: `(T) expr` is emitted as just
+                // `expr`. The target type is irrelevant to dhscanner
+                // analyses -- same philosophy as the UNBOUNDED_WILDCARD
+                // / MODIFIERS drops, except here we keep the interesting
+                // child instead of returning null. Done at the printer
+                // level ( not grammar-side like PARENTHESIZED ) because
+                // (a) the cast carries two children and only one is
+                // kept, and (b) consumers downstream never need to
+                // discriminate casts from direct references.
+                TypeCastTree castTree = (TypeCastTree) node;
+                scan(castTree.getExpression(), null);
+                return null;
+            }
+
+            if (node.getKind() == Tree.Kind.UNBOUNDED_WILDCARD) {
+                // `?` in `Foo<?>`. The downstream dhscanner AST only
+                // keeps the raw type (`Foo`); the unbounded wildcard
+                // argument is syntactic noise with no analysis value.
+                // Eliding it here means `Class<?>` lands as
+                // PARAMETERIZED_TYPE with a single IDENTIFIER("Class")
+                // child -- the existing `parameterized_type` rule
+                // already accepts that, and `parameterizedType` already
+                // drops type-args and returns the base.
+                return null;
+            }
+
+            if (node.getKind() == Tree.Kind.MODIFIERS) {
+                // MODIFIERS is a wrapper around (a) a bitset of flag
+                // keywords ( PUBLIC / PRIVATE / STATIC / FINAL / ... )
+                // -- pure syntactic noise for downstream analyses --
+                // and (b) a list of ANNOTATION children. The three
+                // kinds that can carry a MODIFIERS ( CLASS, VARIABLE,
+                // METHOD ) ALL hoist its annotations to a dedicated
+                // top-level `annotations` key via emitAnnotations(),
+                // so the wrapper itself has nothing left to contribute.
+                // Making it invisible here means it never leaks into
+                // any parent's `children:[]` array -- CLASS and VARIABLE
+                // never scan() their MODIFIERS node to begin with
+                // (they call emitAnnotations() on it directly), and
+                // METHOD now gets the same enrichment below. This
+                // keeps the design principle uniform: "MODIFIERS gone,
+                // annotations always preserved" ( see JAVA_PROGRESS.md ).
+                return null;
+            }
+
             if (!firstInArray) {
                 out.append(',');
             }
             firstInArray = false;
 
             out.append('{');
-            out.append("\"kind\":\"").append(node.getKind().name()).append('"');
+            // Javac's Tree.Kind collapses both constructors and regular
+            // methods under Kind.METHOD; the only way to tell them apart
+            // on the tree is MethodTree.getReturnType() returning null
+            // for constructors ( per the Java spec -- regular methods
+            // MUST declare a return type, even `void` ). We split them
+            // here into kind "CONSTRUCTOR" vs kind "METHOD" so the
+            // downstream grammar can discriminate with a clean
+            // kind-token terminal ( `'CONSTRUCTOR'` vs `'METHOD'` )
+            // instead of having to peek at the `text` payload for the
+            // `<init>` sentinel. Semantically meaningful split too:
+            // ctors have no return type, so the children shape is a
+            // strict subset ( `[ PARAMETER*, BLOCK ]` ) of what a
+            // regular method emits ( `[ returnType, PARAMETER*, BLOCK ]` ).
+            String kindName = node.getKind().name();
+            if (node instanceof MethodTree && ((MethodTree) node).getReturnType() == null) {
+                kindName = "CONSTRUCTOR";
+            }
+            out.append("\"kind\":\"").append(kindName).append('"');
             emitLocation(node);
             String text = extractText(node);
             if (text != null) {
@@ -229,6 +295,83 @@ final class AstPrinter {
                 emitAnnotations(varTree.getModifiers());
                 emitNamedChild("type", varTree.getType());
                 emitNamedChild("init", varTree.getInitializer());
+            } else if (node instanceof BinaryTree) {
+                // Binary-operator expressions ( `a + b`, `x == y`,
+                // `n * m`, ... ). The javac `Tree.Kind` already encodes
+                // the operator ( `PLUS` / `EQUAL_TO` / `MULTIPLY` / … )
+                // via the kind name, so there's no separate operator
+                // payload to hoist -- we just promote the two operands
+                // from positional `children:[ left, right ]` into named
+                // `left` + `right` keys ( symmetric with `IF`'s cond /
+                // body promotion and `VARIABLE`'s type / init ).
+                // `children:[]` is kept but empty, matching the shape
+                // every other printer-enriched kind uses ( CLASS /
+                // VARIABLE / METHOD / IF ).
+                BinaryTree binaryTree = (BinaryTree) node;
+                emitNamedChild("left",  binaryTree.getLeftOperand());
+                emitNamedChild("right", binaryTree.getRightOperand());
+                out.append(",\"children\":[]");
+            } else if (node instanceof IfTree) {
+                // `if (cond) then; else else;` -- hoist the condition
+                // and the then-branch to named keys ( `cond`, `body` )
+                // instead of relying on the generic positional
+                // `children:[ cond, then, else? ]` shape. The optional
+                // else-arm stays in `children:[]` ( zero or one entry )
+                // -- symmetric with how `VARIABLE`'s optional `init`
+                // slot is modelled as a presence/absence decision on
+                // the named key. getCondition() per the Java spec is
+                // always a `ParenthesizedTree` ( `if ( ... )` requires
+                // the parens syntactically ) ; we deliberately keep
+                // the `PARENTHESIZED` wrapper on the emitted `cond`
+                // value and let the grammar's `exp_parenthesized`
+                // alternative unwrap it, so the printer stays agnostic
+                // of the one-vs-nested-parens question ( `if (((x)))` ).
+                IfTree ifTree = (IfTree) node;
+                emitNamedChild("cond", ifTree.getCondition());
+                emitNamedChild("body", ifTree.getThenStatement());
+                out.append(",\"children\":[");
+                boolean savedFirstInArray = firstInArray;
+                firstInArray = true;
+                scan(ifTree.getElseStatement(), null);
+                firstInArray = savedFirstInArray;
+                out.append(']');
+            } else if (node instanceof MethodTree) {
+                // Same annotation-hoisting pattern as CLASS / VARIABLE,
+                // plus a second lift that promotes `getParameters()` to
+                // a dedicated top-level `parameters` key. Each parameter
+                // is emitted via emitParameter() as a slimmed envelope
+                // ( kind "PARAMETER", loc, text, type ) rather than the
+                // full VARIABLE shape ; same strategy as the earlier
+                // CONSTRUCTOR vs METHOD split -- a dedicated printer-
+                // level kind lets the grammar discriminate with a
+                // clean kind-token terminal instead of overloading the
+                // existing `variable` rule, which carries slots
+                // ( annotations, init ) that method params in practice
+                // never populate. `children` is then only `returnType`
+                // ( `null` for ctors ) + body + the rare throws /
+                // typeParameters / receiverParameter / defaultValue
+                // trees, walked explicitly in javac's canonical order.
+                // We DO NOT call super.scan() here anymore because its
+                // default visitMethod() would re-visit the parameter
+                // VariableTrees we just hoisted, double-emitting them.
+                MethodTree methodTree = (MethodTree) node;
+                emitAnnotations(methodTree.getModifiers());
+                emitParameters(methodTree);
+                out.append(",\"children\":[");
+                boolean savedFirstInArray = firstInArray;
+                firstInArray = true;
+                for (TypeParameterTree tp : methodTree.getTypeParameters()) {
+                    scan(tp, null);
+                }
+                scan(methodTree.getReturnType(), null);
+                scan(methodTree.getReceiverParameter(), null);
+                for (Tree thr : methodTree.getThrows()) {
+                    scan(thr, null);
+                }
+                scan(methodTree.getBody(), null);
+                scan(methodTree.getDefaultValue(), null);
+                firstInArray = savedFirstInArray;
+                out.append(']');
             } else {
                 out.append(",\"children\":[");
                 // Enter a fresh "first child" context, scan children via
@@ -302,6 +445,48 @@ final class AstPrinter {
             }
             firstInArray = saved;
             out.append(']');
+        }
+
+        /**
+         * Hoist a {@link MethodTree}'s parameters into a dedicated
+         * top-level {@code parameters} JSON array. Each entry uses the
+         * slim {@link #emitParameter} shape rather than the generic
+         * {@code VARIABLE} envelope -- see the big comment in
+         * {@link #scan} for why we mint a dedicated kind.
+         */
+        private void emitParameters(MethodTree node) {
+            out.append(",\"parameters\":[");
+            boolean saved = firstInArray;
+            firstInArray = true;
+            for (VariableTree p : node.getParameters()) {
+                emitParameter(p);
+            }
+            firstInArray = saved;
+            out.append(']');
+        }
+
+        /**
+         * Emit a single method / constructor parameter as a slim
+         * {@code {"kind":"PARAMETER","loc":...,"text":...,"type":...}}
+         * envelope. We intentionally do NOT lift annotations or an
+         * initializer here: Java parameters cannot carry initializers,
+         * and parameter annotations ({@code @NotNull String s} etc.)
+         * are rare enough that growing the envelope now would be
+         * YAGNI -- if a file surfaces one we add an {@code annotations}
+         * slot in a later iteration, same way {@code VARIABLE} did.
+         */
+        private void emitParameter(VariableTree p) {
+            if (!firstInArray) {
+                out.append(',');
+            }
+            firstInArray = false;
+            out.append('{');
+            out.append("\"kind\":\"PARAMETER\"");
+            emitLocation(p);
+            out.append(",\"text\":");
+            writeJsonString(sanitiseForLexer(p.getName().toString()));
+            emitNamedChild("type", p.getType());
+            out.append('}');
         }
 
         /**
