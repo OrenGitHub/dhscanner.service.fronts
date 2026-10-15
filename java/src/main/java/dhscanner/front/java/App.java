@@ -92,6 +92,17 @@ public final class App {
             // reading our response).
             String source = new String(file.content, StandardCharsets.UTF_8);
             String ast = AstPrinter.printToJson(filename, source);
+            // Reformat into indented JSON before shipping so that the
+            // downstream Happy parse-error location reported by the
+            // parsers service ( `JavaParser.y` -> `[line:col-line:col]` )
+            // points at a human-readable line/column in the native AST
+            // instead of a single-line byte-offset into a 40k-char
+            // one-liner. The Haskell JavaLexer.x consumes `$white+` as
+            // skipped whitespace, so the extra newlines/indent are
+            // transparent to the grammar but let the agent-loop driver
+            // ( and anyone eyeballing a failing file on disk ) land on
+            // the exact native-AST node that trips the grammar.
+            ast = prettyPrint(ast);
             send(ex, 200, ast, "application/json");
         } catch (Throwable t) {
             // Match the "front-side failure, drop this file" convention of
@@ -104,6 +115,90 @@ public final class App {
             System.err.println("[frontjava] parse error for " + filename
                 + ": " + t.getClass().getSimpleName() + ": " + t.getMessage());
             send(ex, 200, "", "text/plain");
+        }
+    }
+
+    /**
+     * Reformat the compact JSON emitted by {@link AstPrinter#printToJson}
+     * into a 2-space-indented form.
+     *
+     * <p>Zero-dep hand-rolled scanner (frontjava's whole point is "no
+     * runtime deps beyond the JDK itself", so no Jackson / gson /
+     * JSONP). {@link AstPrinter}'s {@code sanitiseForLexer} has already
+     * stripped every {@code "} and {@code \} out of every string
+     * payload before it reaches here, so "am I inside a JSON string?"
+     * degenerates to a toggle on every {@code "}; the inner-string
+     * branch therefore does no escape-handling of its own.
+     *
+     * <p>Empty objects / arrays stay on one line ({@code {}} and
+     * {@code []}); every other structural token gets a newline + indent
+     * after it. Keys and values are joined by {@code ": "} rather than
+     * the bare colon so the output round-trips through any JSON tool
+     * that doesn't tolerate the compact form.
+     */
+    private static String prettyPrint(String compact) {
+        if (compact.isEmpty()) {
+            return compact;
+        }
+        StringBuilder out = new StringBuilder((int) (compact.length() * 1.3));
+        int indent = 0;
+        boolean inString = false;
+        for (int i = 0, n = compact.length(); i < n; i++) {
+            char c = compact.charAt(i);
+            if (inString) {
+                out.append(c);
+                if (c == '"') {
+                    inString = false;
+                }
+                continue;
+            }
+            switch (c) {
+                case '"':
+                    out.append(c);
+                    inString = true;
+                    break;
+                case '{':
+                case '[': {
+                    char next = (i + 1 < n) ? compact.charAt(i + 1) : 0;
+                    if ((c == '{' && next == '}') || (c == '[' && next == ']')) {
+                        // Collapse "{}" / "[]" onto one line -- a
+                        // standalone `annotations:[]` or `supers:[]`
+                        // adds no information and costs two lines.
+                        out.append(c).append(next);
+                        i++;
+                    } else {
+                        out.append(c);
+                        indent++;
+                        out.append('\n');
+                        appendIndent(out, indent);
+                    }
+                    break;
+                }
+                case '}':
+                case ']':
+                    indent--;
+                    out.append('\n');
+                    appendIndent(out, indent);
+                    out.append(c);
+                    break;
+                case ',':
+                    out.append(c).append('\n');
+                    appendIndent(out, indent);
+                    break;
+                case ':':
+                    out.append(':').append(' ');
+                    break;
+                default:
+                    out.append(c);
+                    break;
+            }
+        }
+        return out.toString();
+    }
+
+    private static void appendIndent(StringBuilder out, int level) {
+        for (int k = 0; k < level; k++) {
+            out.append("  ");
         }
     }
 
