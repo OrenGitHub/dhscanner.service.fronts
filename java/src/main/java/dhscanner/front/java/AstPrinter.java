@@ -72,6 +72,12 @@ import java.util.List;
  * }
  * </pre>
  *
+ * {@code children} is omitted entirely on leaves (identifiers, literals,
+ * primitive types -- their payload is {@code text}) and on kinds whose
+ * sub-trees have all been promoted to named keys ({@code METHOD} /
+ * {@code CONSTRUCTOR}, {@code VARIABLE}, binary operators). An empty
+ * {@code "children":[]} would be noise the grammar then has to echo.
+ *
  * The {@code loc} key is present for every tree that has a mapped source
  * position (javac can emit synthetic trees with {@code start == -1}; we
  * omit {@code loc} for those -- see the {@code endPos &lt; 0} branches
@@ -312,14 +318,12 @@ final class AstPrinter {
                 // payload to hoist -- we just promote the two operands
                 // from positional `children:[ left, right ]` into named
                 // `left` + `right` keys ( symmetric with `IF`'s cond /
-                // body promotion and `VARIABLE`'s type / init ).
-                // `children:[]` is kept but empty, matching the shape
-                // every other printer-enriched kind uses ( CLASS /
-                // VARIABLE / METHOD / IF ).
+                // body promotion and `VARIABLE`'s type / init ). No
+                // `children` key: both slots are named, so an empty
+                // array would be noise the grammar then has to echo.
                 BinaryTree binaryTree = (BinaryTree) node;
                 emitNamedChild("left",  binaryTree.getLeftOperand());
                 emitNamedChild("right", binaryTree.getRightOperand());
-                out.append(",\"children\":[]");
             } else if (node instanceof IfTree) {
                 // `if (cond) then; else else;` -- hoist the condition
                 // and the then-branch to named keys ( `cond`, `body` )
@@ -345,42 +349,75 @@ final class AstPrinter {
                 out.append(']');
             } else if (node instanceof MethodTree) {
                 // Same annotation-hoisting pattern as CLASS / VARIABLE,
-                // plus a second lift that promotes `getParameters()` to
-                // a dedicated top-level `parameters` key. Each parameter
-                // is emitted via emitParameter() as a slimmed envelope
-                // ( kind "PARAMETER", loc, text, type ) rather than the
-                // full VARIABLE shape ; same strategy as the earlier
-                // CONSTRUCTOR vs METHOD split -- a dedicated printer-
-                // level kind lets the grammar discriminate with a
-                // clean kind-token terminal instead of overloading the
-                // existing `variable` rule, which carries slots
-                // ( annotations, init ) that method params in practice
-                // never populate. `children` is then only `returnType`
-                // ( `null` for ctors ) + body + the rare throws /
-                // typeParameters / receiverParameter / defaultValue
-                // trees, walked explicitly in javac's canonical order.
-                // We DO NOT call super.scan() here anymore because its
-                // default visitMethod() would re-visit the parameter
-                // VariableTrees we just hoisted, double-emitting them.
+                // plus three further lifts that promote the three
+                // semantically-meaningful slots to dedicated top-level
+                // keys instead of smuggling them in positionally under
+                // `children`:
+                //
+                //   `parameters` -- the `getParameters()` list, each
+                //       entry emitted via emitParameter() as a slimmed
+                //       envelope ( kind "PARAMETER", loc, text, type )
+                //       rather than the full VARIABLE shape ; same
+                //       strategy as the earlier CONSTRUCTOR vs METHOD
+                //       split -- a dedicated printer-level kind lets
+                //       the grammar discriminate with a clean kind-
+                //       token terminal instead of overloading the
+                //       existing `variable` rule, which carries slots
+                //       ( annotations, init ) that method params in
+                //       practice never populate.
+                //
+                //   `returnType` -- `getReturnType()`, emitted only for
+                //       METHOD ( never for CONSTRUCTOR, where it is
+                //       always `null` per the Java spec ). Hoisting it
+                //       to a named key is what finally lets `stmt_method`
+                //       in JavaParser.y express the abstract / interface
+                //       method case ( `body` present-vs-absent is
+                //       orthogonal to `returnType`, which is always
+                //       required by Java ).
+                //
+                //   `body` -- `getBody()`, emitted as a 0-or-1 element
+                //       JSON array `[ BLOCK ]`. Javac's typed API
+                //       guarantees the body is either a BlockTree or
+                //       null, so the array shape is "say what you mean"
+                //       : abstract / interface methods get `[]`,
+                //       concrete methods get `[ BLOCK ]`, and
+                //       constructors always get `[ BLOCK ]` ( ctors
+                //       must have a body per the Java spec ). The array
+                //       wrapping keeps the "slot is a list of children"
+                //       pattern uniform with `annotations`, `parameters`,
+                //       `supers` -- the grammar helper
+                //       `possibly_empty_commalistof(stmt_block)` then
+                //       works for both the method and ctor rules without
+                //       a separate optional-prefix nonterminal.
+                //
+                // The long-tail method parts ( type parameters, receiver
+                // parameter, throws clause, annotation-type default
+                // value ) are dropped entirely rather than smuggled into
+                // a `children` slot: the downstream grammar and the
+                // dhscanner AST do not model them today, and the old
+                // `[returnType, body]`-shaped grammar rule already
+                // rejected any method that carried any of them, so
+                // dropping them is strictly a parse-coverage gain.
+                // Consequently NO `children` key is emitted here at all
+                // -- `annotations` / `parameters` / `returnType` / `body`
+                // are the full set of slots for a METHOD / CONSTRUCTOR
+                // envelope. A `children:[]` would be pure noise, so the
+                // emitter and the grammar skip it in lockstep.
+                //
+                // We DO NOT call super.scan() here because its default
+                // visitMethod() would re-visit the parameter VariableTrees
+                // we just hoisted, double-emitting them.
                 MethodTree methodTree = (MethodTree) node;
                 emitAnnotations(methodTree.getModifiers());
                 emitParameters(methodTree);
-                out.append(",\"children\":[");
-                boolean savedFirstInArray = firstInArray;
+                emitNamedChild("returnType", methodTree.getReturnType());
+                out.append(",\"body\":[");
+                boolean savedFirstInBody = firstInArray;
                 firstInArray = true;
-                for (TypeParameterTree tp : methodTree.getTypeParameters()) {
-                    scan(tp, null);
-                }
-                scan(methodTree.getReturnType(), null);
-                scan(methodTree.getReceiverParameter(), null);
-                for (Tree thr : methodTree.getThrows()) {
-                    scan(thr, null);
-                }
                 scan(methodTree.getBody(), null);
-                scan(methodTree.getDefaultValue(), null);
-                firstInArray = savedFirstInArray;
+                firstInArray = savedFirstInBody;
                 out.append(']');
-            } else {
+            } else if (!isLeafWithoutChildren(node)) {
                 out.append(",\"children\":[");
                 // Enter a fresh "first child" context, scan children via
                 // the default visit* implementations, then restore. Note
@@ -514,6 +551,21 @@ final class AstPrinter {
             firstInArray = true;
             scan(child, null);
             firstInArray = saved;
+        }
+
+        /**
+         * Kinds whose payload is entirely in {@code text} (and {@code loc}).
+         * They never have sub-trees, so the printer skips the
+         * {@code children} key altogether. Covers IDENTIFIER,
+         * PRIMITIVE_TYPE, and every {@link LiteralTree} kind -- including
+         * CHAR / LONG / FLOAT / DOUBLE, which the grammar does not yet
+         * match, so a later rule for them does not have to unlearn an
+         * empty array.
+         */
+        private static boolean isLeafWithoutChildren(Tree node) {
+            return node instanceof LiteralTree
+                || node instanceof IdentifierTree
+                || node instanceof PrimitiveTypeTree;
         }
 
         private void emitLocation(Tree node) {
