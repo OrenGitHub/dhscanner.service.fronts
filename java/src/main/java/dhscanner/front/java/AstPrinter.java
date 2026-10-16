@@ -14,6 +14,7 @@ import com.sun.source.tree.LiteralTree;
 import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.ModifiersTree;
+import com.sun.source.tree.ParenthesizedTree;
 import com.sun.source.tree.PrimitiveTypeTree;
 import com.sun.source.tree.Tree;
 import com.sun.source.tree.TypeCastTree;
@@ -190,13 +191,21 @@ final class AstPrinter {
                 // `expr`. The target type is irrelevant to dhscanner
                 // analyses -- same philosophy as the UNBOUNDED_WILDCARD
                 // / MODIFIERS drops, except here we keep the interesting
-                // child instead of returning null. Done at the printer
-                // level ( not grammar-side like PARENTHESIZED ) because
-                // (a) the cast carries two children and only one is
-                // kept, and (b) consumers downstream never need to
-                // discriminate casts from direct references.
+                // child instead of returning null.
                 TypeCastTree castTree = (TypeCastTree) node;
                 scan(castTree.getExpression(), null);
+                return null;
+            }
+
+            if (node instanceof ParenthesizedTree) {
+                // Transparent unwrap: `( expr )` is emitted as just
+                // `expr`. Parentheses carry no analysis signal beyond
+                // operator precedence, which the AST already encodes
+                // structurally. Nested parens `(((x)))` collapse
+                // naturally via the recursive scan() call. Same shape
+                // as the TypeCastTree branch above.
+                ParenthesizedTree parenTree = (ParenthesizedTree) node;
+                scan(parenTree.getExpression(), null);
                 return null;
             }
 
@@ -321,11 +330,10 @@ final class AstPrinter {
                 // slot is modelled as a presence/absence decision on
                 // the named key. getCondition() per the Java spec is
                 // always a `ParenthesizedTree` ( `if ( ... )` requires
-                // the parens syntactically ) ; we deliberately keep
-                // the `PARENTHESIZED` wrapper on the emitted `cond`
-                // value and let the grammar's `exp_parenthesized`
-                // alternative unwrap it, so the printer stays agnostic
-                // of the one-vs-nested-parens question ( `if (((x)))` ).
+                // the parens syntactically ) ; the recursive scan()
+                // transparently unwraps the parens ( see the
+                // ParenthesizedTree branch above ), so the emitted
+                // `cond` value is directly the inner expression.
                 IfTree ifTree = (IfTree) node;
                 emitNamedChild("cond", ifTree.getCondition());
                 emitNamedChild("body", ifTree.getThenStatement());
