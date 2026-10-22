@@ -512,13 +512,10 @@ final class AstPrinter {
 
         /**
          * Emit a single method / constructor parameter as a slim
-         * {@code {"kind":"PARAMETER","loc":...,"text":...,"type":...}}
-         * envelope. We intentionally do NOT lift annotations or an
-         * initializer here: Java parameters cannot carry initializers,
-         * and parameter annotations ({@code @NotNull String s} etc.)
-         * are rare enough that growing the envelope now would be
-         * YAGNI -- if a file surfaces one we add an {@code annotations}
-         * slot in a later iteration, same way {@code VARIABLE} did.
+         * {@code {"kind":"PARAMETER","loc":...,"text":...,"annotations":[...],"type":...}}
+         * envelope. Parameters cannot carry initializers, but their
+         * annotations matter: Spring user input arrives through
+         * {@code @RequestParam} / {@code @PathVariable} / {@code @RequestBody}.
          */
         private void emitParameter(VariableTree p) {
             if (!firstInArray) {
@@ -530,6 +527,7 @@ final class AstPrinter {
             emitLocation(p);
             out.append(",\"text\":");
             writeJsonString(sanitiseForLexer(p.getName().toString()));
+            emitAnnotations(p.getModifiers());
             emitNamedChild("type", p.getType());
             out.append('}');
         }
