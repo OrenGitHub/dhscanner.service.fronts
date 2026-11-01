@@ -13,4 +13,5 @@ COPY development.rb config/environments
 COPY production.rb config/environments
 COPY Gemfile Gemfile
 EXPOSE 3000
-CMD [ "rails", "server", "-b", "0.0.0.0" ]
+# a restarted container keeps tmp/pids/server.pid , and rails then refuses to boot
+CMD [ "sh", "-c", "rm -f tmp/pids/server.pid && exec rails server -b 0.0.0.0" ]
