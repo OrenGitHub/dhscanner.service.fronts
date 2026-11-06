@@ -9,6 +9,7 @@ WORKDIR translator
 RUN gem install syntax_tree
 COPY routes.rb config
 COPY translator_controller.rb app/controllers
+COPY rewrite.rb lib/dhscanner_rewrite.rb
 COPY development.rb config/environments
 COPY production.rb config/environments
 COPY Gemfile Gemfile
