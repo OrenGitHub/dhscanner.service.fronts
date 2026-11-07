@@ -93,10 +93,53 @@ module DhscannerRewrite
         names[name] = location if !names.key?(name) || names[name].nil?
       end
     end
+    qualified_classes(tree, []) do |name, location|
+      names[name] = location if !names.key?(name) || names[name].nil?
+    end
     names.to_a
   end
 
-  # `class X` / `module X` / `class ::X` at the top level ( `class A::B` is not kept yet )
+  # the qualified classes / modules `tree` defines, dotted like the parsers
+  # name them : `class Admin::StaffController` and `module Admin ; class
+  # StaffController` are both `Admin.StaffController` ( runner #152 ). Only
+  # under modules : the parsers prefix a class with its enclosing modules,
+  # not classes. Yields [ name, location ], a class at its constant.
+  def self.qualified_classes(node, modules, &block)
+    case node
+    when Hash
+      if %w[class module].include?(node["type"])
+        path = constant_path(node["constant"])
+        return if path.nil?
+        full = modules + path
+        location = node["type"] == "class" ? node["constant"]["location"] : nil
+        yield full.join("."), location if full.length > 1
+        return if node["type"] == "class"
+        return qualified_classes(node["bodystmt"], full, &block)
+      end
+      return if node["type"] == "sclass"
+      node.each_value { |v| qualified_classes(v, modules, &block) }
+    when Array
+      node.each { |v| qualified_classes(v, modules, &block) }
+    end
+  end
+
+  # `A::B::C` -> [ "A", "B", "C" ], `::A` -> [ "A" ], nil if a part is not a constant
+  def self.constant_path(node)
+    return nil unless node.is_a?(Hash)
+    case node["type"]
+    when "const_ref", "top_const_ref"
+      [ node.dig("constant", "value") ].compact.then { |p| p.empty? ? nil : p }
+    when "var_ref"
+      value = node["value"]
+      value.is_a?(Hash) && value["type"] == "const" ? [ value["value"] ] : nil
+    when "const_path_ref"
+      parent = constant_path(node["parent"])
+      name = node.dig("constant", "value")
+      parent && name ? parent + [ name ] : nil
+    end
+  end
+
+  # `class X` / `module X` / `class ::X` at the top level ( `class A::B` is in `qualified_classes` )
   def self.top_level_class(node, depth)
     constant = node["constant"]
     return nil unless depth == 0 && constant.is_a?(Hash)
@@ -158,6 +201,9 @@ module DhscannerRewrite
       value["value"] if value.is_a?(Hash) && %w[const gvar].include?(value["type"])
     when "top_const_ref"
       node.dig("constant", "value")
+    when "const_path_ref"
+      path = constant_path(node)
+      path.join(".") if path
     end
   end
 
@@ -175,6 +221,7 @@ module DhscannerRewrite
         names << node.dig("constant", "constant", "value")
       end
     end
+    qualified_classes(tree, []) { |name, _| names << name }
     names
   end
 
