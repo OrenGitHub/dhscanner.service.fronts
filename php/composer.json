@@ -1,10 +1,12 @@
 {
     "name": "dhscanner/frontphp",
-    "description": "Tiny PHP HTTP front for dhscanner. Wraps nikic/PhpParser behind a single POST endpoint served by PHP's built-in dev server. Deliberately framework-less: no Laravel, no routing library, no CSRF, no sessions. The whole HTTP surface is index.php. Blade-template preprocessing (which used to live behind a second POST endpoint and pulled in illuminate/view + illuminate/filesystem) has been removed; the only PHP corpus we benchmark against contains no blade files and the dep / endpoint can be restored as a focused diff if a blade-heavy target appears.",
+    "description": "Tiny PHP HTTP front for dhscanner. Wraps nikic/PhpParser behind a single POST endpoint served by PHP's built-in dev server. Deliberately framework-less: no Laravel, no routing library, no CSRF, no sessions. The whole HTTP surface is index.php. Blade templates (*.blade.php) are compiled to plain PHP first, with illuminate/view's BladeCompiler.",
     "type": "project",
     "license": "MIT",
     "require": {
         "php": ">=8.1",
-        "nikic/php-parser": "^5.0"
+        "nikic/php-parser": "^5.0",
+        "illuminate/view": "^12.0",
+        "illuminate/filesystem": "^12.0"
     }
 }

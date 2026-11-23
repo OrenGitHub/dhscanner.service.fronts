@@ -13,7 +13,9 @@
  * pattern we have here):
  *
  *   GET  /healthcheck    -> 200 {"healthy": true}
- *   POST /to/php/ast     -> NodeDumper output of nikic/PhpParser
+ *   POST /to/php/ast     -> NodeDumper output of nikic/PhpParser ; a
+ *                           `*.blade.php` upload is compiled to plain PHP
+ *                           first ( Laravel's BladeCompiler )
  *
  * `php -S` invokes this script for every incoming request. We dispatch
  * on (REQUEST_METHOD, URI path) and emit the body directly via `echo`.
@@ -21,14 +23,13 @@
  * that the request was handled; returning `false` would tell it to fall
  * back to static-file serving from the document root, which we never want.
  *
- * NOTE: the previous Laravel-based front also exposed `POST /to/php/code`
- * to preprocess `*.blade.php` templates (compile blade -> plain PHP, then
- * extract `<?php ... ?>` chunks). That endpoint and its `illuminate/view`
- * + `illuminate/filesystem` dependencies have been removed because the
- * current focus -- and the only PHP corpus we benchmark against
- * (`C:\Users\tuna_\GitHub\zabbix`) -- contains zero blade templates. When
- * a blade-heavy codebase becomes a real target, restoring the route is a
- * focused diff against THIS file plus its dependency manifest.
+ * Blade : a `*.blade.php` file ( the upload's name ) is compiled by
+ * Laravel's own BladeCompiler, and the whole compiled PHP is parsed like
+ * any php file : `@php .. @endphp` and `{{ $x }}` become `<?php .. ?>`, the
+ * markup stays inline html ( nulled as usual ), so the lines stay where
+ * they were. `@include( 'a.b' )` stays a call, `$__env->make( 'a.b', .. )`.
+ * The previous front kept only the `<?php ?>` chunks, joined, and dropped
+ * the includes.
  */
 
 require __DIR__ . '/vendor/autoload.php';
@@ -39,6 +40,8 @@ use PhpParser\ParserFactory;
 use PhpParser\Node;
 use PhpParser\NodeTraverser;
 use PhpParser\NodeVisitorAbstract;
+use Illuminate\Filesystem\Filesystem;
+use Illuminate\View\Compilers\BladeCompiler;
 
 /**
  * Same string / inline-HTML normalization the previous Laravel front
@@ -89,6 +92,26 @@ function read_uploaded_source(): ?string
     return $bytes === false ? null : $bytes;
 }
 
+function uploaded_source_is_blade(): bool
+{
+    $name = $_FILES['source']['name'] ?? '';
+    return is_string($name) && str_ends_with($name, '.blade.php');
+}
+
+/**
+ * Blade -> plain PHP, or null when the compiler throws. compileString
+ * writes nothing, the cache path is only required by the constructor.
+ */
+function compile_blade(string $template): ?string
+{
+    $compiler = new BladeCompiler(new Filesystem(), sys_get_temp_dir());
+    try {
+        return $compiler->compileString($template);
+    } catch (\Throwable $e) {
+        return null;
+    }
+}
+
 function handle_healthcheck(): void
 {
     header('Content-Type: application/json');
@@ -104,6 +127,13 @@ function handle_to_php_ast(): void
         // a literal "ERROR" body as "front-side failure, drop this file".
         echo "ERROR";
         return;
+    }
+    if (uploaded_source_is_blade()) {
+        $code = compile_blade($code);
+        if ($code === null) {
+            echo "ERROR";
+            return;
+        }
     }
 
     $parser = (new ParserFactory())->createForNewestSupportedVersion();
