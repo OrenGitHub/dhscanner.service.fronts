@@ -69,6 +69,302 @@ final class StringNormalizer extends NodeVisitorAbstract
 }
 
 /**
+ * A variable a blade template reads but never binds : Laravel injects it
+ * ( the data array of `view( 'a.b', [ 'k' => .. ] )`, or every variable of
+ * the parent template for `@include` ). Dumped as
+ *
+ *     BladePhp_UnboundVar[l:c - l:c]( name: Scalar_String[..]( value: "k" ) )
+ *
+ * and lowered by the parsers to `<dhscanner-instrumentation>[unbound-var-blade-php-file]( 'k' )`.
+ */
+final class BladePhpUnboundVar extends Node\Expr
+{
+    public Node\Scalar\String_ $name;
+
+    public function __construct(Node\Scalar\String_ $name, array $attributes = [])
+    {
+        $this->attributes = $attributes;
+        $this->name = $name;
+    }
+
+    public function getSubNodeNames(): array
+    {
+        return ['name'];
+    }
+
+    public function getType(): string
+    {
+        return 'BladePhp_UnboundVar';
+    }
+}
+
+/**
+ * The unbound variables of a compiled blade file : every top level read of
+ * a `$name` no earlier statement bound, in order of execution ( the right
+ * side of an assignment before its left side ). Functions, methods,
+ * closures and classes have scopes of their own, so they are not entered
+ * ( closure `use ( $x )` is a read ). A binding in a branch counts as a
+ * binding after it. Superglobals, `$this` and Blade's own internals
+ * ( `$__env`, `$__data`, .. ) are not reported.
+ *
+ * Returns name => the first unbound read ( its node, for the location ).
+ */
+final class UnboundVars
+{
+    private const IGNORED = [
+        'this', 'GLOBALS', '_SERVER', '_GET', '_POST', '_FILES', '_COOKIE',
+        '_SESSION', '_REQUEST', '_ENV', 'argv', 'argc',
+    ];
+
+    /** @var array<string, true> */
+    private array $bound = [];
+
+    /** @var array<string, Node\Expr\Variable> */
+    private array $unbound = [];
+
+    /** @param Node[] $stmts */
+    public static function of(array $stmts): array
+    {
+        $walker = new self();
+        $walker->walk($stmts);
+        return $walker->unbound;
+    }
+
+    private function walk($node): void
+    {
+        if (is_array($node)) {
+            foreach ($node as $n) {
+                $this->walk($n);
+            }
+            return;
+        }
+        if (!($node instanceof Node)) {
+            return;
+        }
+        if (
+            $node instanceof Node\Stmt\Function_ ||
+            $node instanceof Node\Stmt\ClassLike ||
+            $node instanceof Node\Expr\ArrowFunction
+        ) {
+            return;
+        }
+        if ($node instanceof Node\Expr\Closure) {
+            foreach ($node->uses as $use) {
+                $this->read($use->var);
+            }
+            return;
+        }
+        if ($node instanceof Node\Expr\Assign || $node instanceof Node\Expr\AssignRef) {
+            $this->walk($node->expr);
+            $this->bind($node->var);
+            return;
+        }
+        if ($node instanceof Node\Stmt\Foreach_) {
+            $this->walk($node->expr);
+            $this->bind($node->keyVar);
+            $this->bind($node->valueVar);
+            $this->walk($node->stmts);
+            return;
+        }
+        if ($node instanceof Node\Stmt\Catch_) {
+            $this->bind($node->var);
+            $this->walk($node->stmts);
+            return;
+        }
+        if ($node instanceof Node\Stmt\Global_ || $node instanceof Node\Stmt\Static_) {
+            foreach ($node->vars as $v) {
+                $this->bind($v instanceof Node\Stmt\StaticVar ? $v->var : $v);
+            }
+            return;
+        }
+        if ($node instanceof Node\Expr\Variable) {
+            $this->read($node);
+            return;
+        }
+        foreach ($node->getSubNodeNames() as $sub) {
+            $this->walk($node->$sub);
+        }
+    }
+
+    /** an assignment target : `$x`, `$x[ .. ]`, `[ $a, $b ]` / `list( .. )` ; anything else is read */
+    private function bind($target): void
+    {
+        if ($target instanceof Node\Expr\Variable && is_string($target->name)) {
+            $this->bound[$target->name] = true;
+            return;
+        }
+        if ($target instanceof Node\Expr\ArrayDimFetch) {
+            $this->walk($target->dim);
+            $this->bind($target->var);
+            return;
+        }
+        if ($target instanceof Node\Expr\Array_ || $target instanceof Node\Expr\List_) {
+            foreach ($target->items as $item) {
+                if ($item !== null) {
+                    $this->walk($item->key);
+                    $this->bind($item->value);
+                }
+            }
+            return;
+        }
+        $this->walk($target);
+    }
+
+    private function read($var): void
+    {
+        if (!($var instanceof Node\Expr\Variable)) {
+            $this->walk($var);
+            return;
+        }
+        $name = $var->name;
+        if (!is_string($name)) {
+            $this->walk($name);
+            return;
+        }
+        if (
+            isset($this->bound[$name]) ||
+            isset($this->unbound[$name]) ||
+            in_array($name, self::IGNORED, true) ||
+            str_starts_with($name, '__')
+        ) {
+            return;
+        }
+        $this->unbound[$name] = $var;
+    }
+}
+
+/**
+ * Prepend `$k = BladePhp_UnboundVar( 'k' );` for every unbound variable,
+ * located at its first unbound read, so the dataflow from the injected
+ * value starts there.
+ *
+ * @param Node[] $stmts
+ * @return Node[]
+ */
+function bind_unbound_vars(array $stmts): array
+{
+    $prologue = [];
+    foreach (UnboundVars::of($stmts) as $name => $read) {
+        $attrs = $read->getAttributes();
+        $value = new BladePhpUnboundVar(new Node\Scalar\String_($name, $attrs), $attrs);
+        $assign = new Node\Expr\Assign(new Node\Expr\Variable($name, $attrs), $value, $attrs);
+        $prologue[] = new Node\Stmt\Expression($assign, $attrs);
+    }
+    return array_merge($prologue, $stmts);
+}
+
+/**
+ * A php superglobal entry with a constant key ( `$GLOBALS['k']` ; `$_GET` /
+ * `$_POST` later ). Dumped as
+ *
+ *     NativePhp_Globals[l:c - l:c]( name: Scalar_String( "GLOBALS" ) key: Scalar_String( "k" ) )            read
+ *     NativePhp_Globals[l:c - l:c]( name: .. key: .. value: <exp> )                                          write
+ *
+ * and lowered by the parsers to `<dhscanner-instrumentation>[native-php-globals]( 'GLOBALS', 'k' [, v ] )`.
+ */
+final class NativePhpGlobals extends Node\Expr
+{
+    public Node\Scalar\String_ $name;
+    public Node\Scalar\String_ $key;
+    public ?Node\Expr $value;
+
+    public function __construct(Node\Scalar\String_ $name, Node\Scalar\String_ $key, ?Node\Expr $value, array $attributes = [])
+    {
+        $this->attributes = $attributes;
+        $this->name = $name;
+        $this->key = $key;
+        $this->value = $value;
+    }
+
+    public function getSubNodeNames(): array
+    {
+        return $this->value === null ? ['name', 'key'] : ['name', 'key', 'value'];
+    }
+
+    public function getType(): string
+    {
+        return 'NativePhp_Globals';
+    }
+}
+
+/**
+ * `$GLOBALS['k']` -> NativePhp_Globals( 'GLOBALS', 'k' ) ; `$GLOBALS['k'] = v`
+ * -> NativePhp_Globals( 'GLOBALS', 'k', v ). Any php file. A dynamic key
+ * ( `$GLOBALS[ $k ]` ) stays as is. Bottom up : the read is replaced first,
+ * then the assignment around it becomes the write.
+ */
+final class NativeGlobalsNormalizer extends NodeVisitorAbstract
+{
+    private const SUPERGLOBALS = ['GLOBALS'];
+
+    public function leaveNode(Node $node)
+    {
+        if (
+            $node instanceof Node\Expr\ArrayDimFetch &&
+            $node->var instanceof Node\Expr\Variable &&
+            is_string($node->var->name) &&
+            in_array($node->var->name, self::SUPERGLOBALS, true) &&
+            $node->dim instanceof Node\Scalar\String_
+        ) {
+            $name = new Node\Scalar\String_($node->var->name, $node->var->getAttributes());
+            return new NativePhpGlobals($name, $node->dim, null, $node->getAttributes());
+        }
+        if (
+            $node instanceof Node\Expr\Assign &&
+            $node->var instanceof NativePhpGlobals &&
+            $node->var->value === null
+        ) {
+            return new NativePhpGlobals($node->var->name, $node->var->key, $node->expr, $node->getAttributes());
+        }
+        return null;
+    }
+}
+
+/**
+ * Laravel view names -> the template file they render, by Laravel's default
+ * convention ( dots, or slashes, are directories under `resources/views`,
+ * a leading slash dropped, `.blade.php` appended ) :
+ *
+ *     view( 'a.b', [ .. ] )                ->  view( 'resources/views/a/b.blade.php', [ .. ] )
+ *     @include( 'a.b' )  ( compiled )      ->  $__env->make( 'resources/views/a/b.blade.php', .. )
+ *
+ * `view` is the global helper ( any php file, blade or not ), `$__env->make`
+ * is what Blade compiles `@include` ( and `@extends` ) to. Only a constant
+ * name is rewritten ; a namespaced `pkg::a.b` or a dynamic name stays as is.
+ */
+final class ViewNameNormalizer extends NodeVisitorAbstract
+{
+    public function enterNode(Node $node)
+    {
+        $isView =
+            $node instanceof Node\Expr\FuncCall &&
+            $node->name instanceof Node\Name &&
+            strtolower($node->name->getLast()) === 'view' &&
+            count($node->name->getParts()) === 1;
+        $isMake =
+            $node instanceof Node\Expr\MethodCall &&
+            $node->var instanceof Node\Expr\Variable &&
+            $node->var->name === '__env' &&
+            $node->name instanceof Node\Identifier &&
+            $node->name->toString() === 'make';
+        if (!$isView && !$isMake) {
+            return null;
+        }
+        $first = $node->args[0] ?? null;
+        if (!($first instanceof Node\Arg) || !($first->value instanceof Node\Scalar\String_)) {
+            return null;
+        }
+        $name = $first->value->value;
+        if (preg_match('#^/?[A-Za-z0-9_\-]+([./][A-Za-z0-9_\-]+)*$#', $name) !== 1) {
+            return null;
+        }
+        $path = str_replace('.', '/', ltrim($name, '/'));
+        $first->value->value = 'resources/views/' . $path . '.blade.php';
+        return null;
+    }
+}
+
+/**
  * Read the uploaded `source` file from a multipart POST.
  *
  * Returns the file's raw bytes on success, or null if either no file was
@@ -128,7 +424,8 @@ function handle_to_php_ast(): void
         echo "ERROR";
         return;
     }
-    if (uploaded_source_is_blade()) {
+    $blade = uploaded_source_is_blade();
+    if ($blade) {
         $code = compile_blade($code);
         if ($code === null) {
             echo "ERROR";
@@ -148,7 +445,17 @@ function handle_to_php_ast(): void
         return;
     }
 
+    if ($blade) {
+        $ast = bind_unbound_vars($ast);
+    }
+
+    // its own pass : the strings it creates must reach StringNormalizer below
+    $globals = new NodeTraverser();
+    $globals->addVisitor(new NativeGlobalsNormalizer());
+    $ast = $globals->traverse($ast);
+
     $traverser = new NodeTraverser();
+    $traverser->addVisitor(new ViewNameNormalizer());
     $traverser->addVisitor(new StringNormalizer());
     $ast = $traverser->traverse($ast);
 
