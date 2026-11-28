@@ -260,7 +260,8 @@ function bind_unbound_vars(array $stmts): array
  *     NativePhp_Globals[l:c - l:c]( name: Scalar_String( "GLOBALS" ) key: Scalar_String( "k" ) )            read
  *     NativePhp_Globals[l:c - l:c]( name: .. key: .. value: <exp> )                                          write
  *
- * and lowered by the parsers to `<dhscanner-instrumentation>[native-php-globals]( 'GLOBALS', 'k' [, v ] )`.
+ * and lowered by the parsers to `<dhscanner-instrumentation>[native-php-globals-read]( 'GLOBALS', 'k' )` /
+ * `<dhscanner-instrumentation>[native-php-globals-write]( 'GLOBALS', 'k', v )`.
  */
 final class NativePhpGlobals extends Node\Expr
 {
